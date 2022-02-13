@@ -1,0 +1,886 @@
+#basic packages
+import os, time, random, shutil
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+from itertools import product, combinations, permutations
+from warnings import filterwarnings
+from random import shuffle
+
+#packages for audio read,preprocessing and save
+import soundfile as sf
+
+#packages for figure
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.patches as mpatches
+import matplotlib as mpl
+from mpl_toolkits.mplot3d import Axes3D
+from wordcloud import WordCloud
+from matplotlib_venn import venn3
+plt.rcParams['font.sans-serif'] = ['SimHei']  # for displaying Chinese Characters
+plt.rcParams['axes.unicode_minus'] = False # for displaying negative sign
+
+#packages for supervised machine learning
+from sklearn.preprocessing import MinMaxScaler,StandardScaler
+from sklearn.feature_selection import SelectKBest
+from sklearn.model_selection import StratifiedKFold as SKF
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import SCORERS
+from sklearn.metrics import RocCurveDisplay, roc_curve, auc, PrecisionRecallDisplay,precision_recall_curve,confusion_matrix,average_precision_score
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression as LR
+from sklearn.tree import DecisionTreeClassifier as DTC
+from sklearn.neighbors import KNeighborsClassifier as KN
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis as QDA
+from sklearn.naive_bayes import GaussianNB as GNB
+from sklearn.ensemble import RandomForestClassifier as RFC
+from sklearn.ensemble import ExtraTreesClassifier as ETC
+from sklearn.ensemble import GradientBoostingClassifier as GBC
+from sklearn.ensemble import AdaBoostClassifier as ABC
+from sklearn.neural_network import MLPClassifier
+
+#packages for unsupervised machine learning
+from sklearn.decomposition import PCA as PCAA
+from pyclust import KMedoids
+from sklearn.manifold import TSNE, MDS
+
+#packages for ML classifiers interpretation and feature selection
+from sklearn.inspection import permutation_importance # permutation inspection (PI) analysis
+import shap #shapley analysis (SHAP)
+from minepy import MINE #maximal information coefficient (MIC)
+from sklearn.cross_decomposition import CCA #canonical correlation analysis (CCA)
+
+#packages for ML models save and read
+import joblib, pickle
+
+#packages for statistical analysis
+import scipy
+from scipy import stats, interpolate
+from lifelines import KaplanMeierFitter,WeibullAFTFitter,CoxPHFitter
+from lifelines.statistics import logrank_test,multivariate_logrank_test
+
+filterwarnings('ignore')
+
+#Hyperparameter settings for 12 ML classifiers
+models = [('LR', LR(max_iter=10000, tol=0.1)), ('LDA', LDA(solver='lsqr', shrinkage='auto')),
+          ('QDA', QDA(store_covariance=True)),
+          ('ET', ETC(n_estimators=10, min_samples_split=2, max_features="sqrt")),
+          ('GBC', GBC(n_estimators=1000, learning_rate=1.0, max_depth=4, max_features='auto')),
+          ('ABC', ABC(n_estimators=400)),
+          ('KNN', KN(n_neighbors=6)), ('CART', DTC()), ('NB', GNB()),
+          ('RSVM',SVC(C=.7, class_weight='balanced', kernel='rbf', cache_size=300, gamma='auto', probability=True)),
+          ('RFC', RFC(min_samples_split=2, n_estimators=10, max_features="sqrt")),
+          ('MLP', MLPClassifier(random_state=1, max_iter=3000, hidden_layer_sizes=(100, 100), batch_size=100,
+                                solver='adam', warm_start=False, early_stopping=True, n_iter_no_change=100,
+                                validation_fraction=0.2))]
+
+# transform to a dictionary
+dmodels=dict(zip([i[0] for i in models],[i[-1] for i in models]))
+
+#parameters for MIC analysis
+mine = MINE(alpha=0.6, c=15)
+
+#Function for MIC value computation
+def MIC_matirx0(dataframe, mine,nvar=['OC_OPC'], nf=['PCA_FCR_3_0.4_20']):
+    # dataframe refers to the dataframe at least containing features in nvar and nf
+    # mine refers to the function used for MIC value computation
+    # nvar controls the features involved in MIC analysis in one dimension, here refers to disease information
+    # nf controls the features involved in MIC analysis in the other dimension, here refers to PCA-transformed features
+    result = np.zeros([len(nf), len(nvar)])
+    for k, i in tqdm(enumerate(nf)):
+        for kk, j in enumerate(nvar):
+            mine.compute_score(dataframe[i].to_numpy(), dataframe[j].to_numpy())
+            result[k, kk] = mine.mic()
+
+        time.sleep
+    RT = pd.DataFrame(result, index=nf, columns=nvar)
+    return RT
+
+std=StandardScaler()
+mms = MinMaxScaler()
+pca = PCAA()
+cca = CCA(n_components=2, max_iter=300)
+
+#function for cca score computation and feature selection via CCA methods
+def CCA_selection(data, data1,bcd, set2, savepath,step=1,ratio=0.2):
+    #data refers to the dataframe containing all feature values of training cohort
+    #data1 refers to the dataframe containing all feature values of test cohort
+    #bcd refers to the dataframe of binary coding disease states
+    #set2 refers to the initial feature set
+    #step controls the number of features deleted per iterative down sampling
+    #ratio determines the anticipated percent of selected features
+    #savepath refers to the absolute path for saving the selection procedure. This will help a lot in case of program crash.
+    ppan=pd.concat([data,data1])
+    std_ppan = pd.DataFrame(std.fit_transform(ppan), index=ppan.index.to_list(), columns=ppan.columns.to_list())
+    std_code = pd.DataFrame(std.fit_transform(bcd), index=bcd.index.to_list(), columns=bcd.columns.to_list())
+    set1=std_code.columns.to_list()
+    pppan = pd.concat([std_code, std_ppan], axis=1)
+    Data = pppan.loc[data.index.to_list()]
+    Data1 = pppan.loc[data1.index.to_list()]
+    pset = pd.DataFrame(columns=['CCA_coef'])
+    pcoef = pd.DataFrame(columns=['CCA_coef'])
+    original_num=len(set2)
+    n = 1
+    while n < (1-ratio) * original_num:
+        for j in tqdm(list(combinations(set2, len(set2) - 1))):
+            cca.fit(Data[set1].to_numpy(), Data[list(j)].to_numpy())
+            coe = cca.score(X=Data1[set1].to_numpy(), y=Data1[list(j)].to_numpy())
+            pset.loc['+'.join(j)] = coe
+            time.sleep
+        pset.sort_values('CCA_coef', inplace=True, ascending=False)
+        #Sorting keeps the most related feature sets at the very first row. 
+        # When down sampling don't improve the CCA score, the left iterations will be redundant.
+        #Therefore, the final selected features are controlled by ratio and CCA score together.
+        set2 = pset.index.to_list()[0].split('+')
+        with open(savepath, 'a+') as f:
+            f.write(str(len(set2)) + ' ' + str(pset.iloc[0, 0]) + ' ' + pset.index.to_list()[0] + '\n')
+        pset = pset.iloc[:1, :1]
+        pcoef.loc[len(set2)] = pset.iloc[0, 0]
+        n += 1
+    return pset,pcoef
+
+#function for permutation of derived features
+def FCRs(df1, df2, df3,name1=['F1(Hz)', 'F2(Hz)'], iter_num=1):
+    # df1 refers to the dataframe contains the feature values of /a/
+    # df2 refers to the dataframe contains the feature values of /i/
+    # df3 refers to the dataframe contains the feature values of /u/
+    # iter_num controls the number of permutation
+    count = 0
+    while count < iter_num:
+        df11 = df1.sample(n=1)
+        df22 = df2.sample(n=1)
+        df33 = df3.sample(n=1)
+        l1 = list(df11[name1].to_numpy().flatten())
+        l2 = list(df22[name1].to_numpy().flatten())
+        l3 = list(df33[name1].to_numpy().flatten())
+        FCR = (l3[1] + l1[1] + l2[0] + l3[0]) / (l2[1] + l1[0])
+        F2R = l2[1] / l3[1]
+        VSA = np.abs((l2[0] * (l1[1] - l3[1]) + l1[0] * (l3[1] - l2[1]) + l3[0] * (
+                l2[1] - l1[1])) / 2)
+        yield FCR, VSA, F2R
+        count += 1
+
+#function for density discretization
+def dense_discrete(data=np.ones(100), Range=[0, 1], intervals=100, index=' '):
+    #data refers to the original feature values ready for density discretization
+    #Range controls the theoretical range for discretization 
+    #intervals determines the resolution of discretization
+    logarr = sorted([x for x in np.logspace(Range[0], Range[1], num=intervals, endpoint=True)])
+    ddata = pd.DataFrame(columns=logarr)
+    for j in reversed(range(intervals)):
+        ddata.loc[index, logarr[j]] = data[data > float(logarr[j])].shape[0]
+        data = data[data <= float(logarr[j])]
+    return ddata
+
+#function for permutations of derived features, density discretization, PCA fit and transform
+def per10000(path, case,pready=True,threshold=0.8, intervals=100):
+    #path refers to the absolute path contains the originial excel files of formants and bandwidth 
+    #case refers to all speakers that are anonymously coded in this study
+    #intervals determines the resolution of discretization
+    #pready works when the 10000 permutations of derived features (i.e. FCR, VSA, and F2R) have been calculated elsewhere before.
+    pdn = pd.DataFrame(columns=[i + '_' + str(j) for i in ['FCR', 'VSA', 'F2R'] for j in range(10000)])
+    pdr = pd.read_excel(path + '\\迭代运算统计结果.xlsx', sheet_name='离散范围', index_col=0)
+    #This excel file contains theoretical range for discretization which is determined by distribution of all speakers' feature values.
+    outpath = '\\'.join(str.split(path, '\\')[:-1] + ['pre_thresh_' + str(threshold)])
+    if not os.path.exists(outpath):
+        os.mkdir(outpath)
+    if pready:
+        pdn = pd.read_csv(outpath + '\\data10000.txt', sep='\t', index_col=0)
+        pl = []
+        for xx, name in enumerate(case):
+            pl0 = []
+            ppa = pd.read_excel(path + '\\' + name + '.xlsx', index_col=0,
+                                sheet_name='a_ori')
+            ppi = pd.read_excel(path + '\\' + name + '.xlsx',
+                                index_col=0, sheet_name='i_ori')
+            ppu = pd.read_excel(path + '\\' + name + '.xlsx',
+                                index_col=0, sheet_name='u_ori')
+            vfcr = pdn.iloc[xx, :10000].to_numpy()
+            vvsa = pdn.iloc[xx, 10000:20000].to_numpy()
+            vf2r = pdn.iloc[xx, 20000:].to_numpy()
+            pl0.append(dense_discrete(data=vfcr, Range=[np.log10(pdr.loc['FCR', 'Minimum']),
+                                                        np.log10(pdr.loc['FCR', 'Maximum'])],
+                                      intervals=intervals, index=name))
+            pl0.append(dense_discrete(data=vvsa, Range=[np.log10(pdr.loc['VSA', 'Maximum']), 1], intervals=intervals,
+                                      index=name))
+            pl0.append(dense_discrete(data=vf2r, Range=[np.log10(pdr.loc['F2R', 'Minimum']),
+                                                        np.log10(pdr.loc['F2R', 'Maximum'])],
+                                      intervals=intervals, index=name))
+            for p in ['F1(Hz)', 'F2(Hz)', 'F3(Hz)']:
+                for vv, uu in zip(['a', 'i', 'u'], [ppa.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppa.shape[0])), :],
+                                                    ppi.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppi.shape[0])), :], 
+                                                    ppu.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppu.shape[0])), :]]):
+                    pl0.append(dense_discrete(data=uu[p].to_numpy(), Range=[np.log10(pdr.loc[p[:2] + vv, 'Minimum']),
+                                                                            np.log10(pdr.loc[p[:2] + vv, 'Maximum'])],
+                                              intervals=intervals, index=name))
+            for p in ['B1(Hz)', 'B2(Hz)', 'B3(Hz)']:
+                for vv, uu in zip(['a', 'i', 'u'], [ppa.sort_values('kde_'+p[:2], ascending=False).iloc[:int(np.ceil(threshold * ppa.shape[0])), :], 
+                                                    ppi.sort_values('kde_'+p[:2], ascending=False).iloc[:int(np.ceil(threshold * ppi.shape[0])), :], 
+                                                    ppu.sort_values('kde_'+p[:2], ascending=False).iloc[:int(np.ceil(threshold * ppu.shape[0])), :]]):
+                    pl0.append(
+                        dense_discrete(data=uu[p].to_numpy(), Range=[np.log10(pdr.loc[p[:2] + vv, 'Maximum']), 0.1],
+                                       intervals=intervals, index=name))
+            pl.append(pd.concat(pl0, axis=1))
+        pdl = pd.concat(pl)
+        npd0 = []
+        for i in range(21):
+            npd0.append(mms.fit_transform(pdl.iloc[:, intervals * i:intervals * (i + 1)]))
+        npd = np.hstack(npd0)
+        pddata = pd.DataFrame(npd, index=pdl.index.to_list(), columns=pdl.columns.to_list())
+        pddata.to_csv(outpath + '\\Density_' + str(intervals) + '.txt', sep='\t', encoding='utf_8_sig')
+    if not pready:
+        sik = {}
+        pl = []
+        for name in case:
+            pl0 = []
+            ppa = pd.read_excel(path + '\\' + name + '.xlsx', index_col=0,
+                                sheet_name='a_ori')
+            ppi = pd.read_excel(path + '\\' + name + '.xlsx',
+                                index_col=0, sheet_name='i_ori')
+            ppu = pd.read_excel(path + '\\' + name + '.xlsx',
+                                index_col=0, sheet_name='u_ori')
+
+            ffta = ppa.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppa.shape[0])), :]
+            ffti = ppi.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppi.shape[0])), :]
+            fftu = ppu.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppu.shape[0])), :]
+            fset = FCRs(df1=ffta, df2=ffti, df3=fftu, name1=['F1(Hz)', 'F2(Hz)'], iter_num=10000)
+            iter = 0
+            nv = np.zeros((10000, 3))
+            try:
+                while iter < 10000:
+                    fcr1, vsa1, f2r1 = next(fset)
+                    nv[iter, 0] = fcr1
+                    nv[iter, 1] = vsa1
+                    nv[iter, 2] = f2r1
+                    iter += 1
+            except:
+                sik[name] = iter #this dictionary will record speakers whose maximal number of combinations is less than 10000
+            vfcr = np.sort(nv[:, 0])[::-1]
+            vvsa = np.sort(nv[:, 1])[::-1]
+            vf2r = np.sort(nv[:, 2])[::-1]
+            pl0.append(dense_discrete(data=vfcr, Range=[np.log10(pdr.loc['FCR', 'Minimum']),
+                                                        np.log10(pdr.loc['FCR', 'Maximum'])],
+                                      intervals=intervals, index=name))
+            pl0.append(dense_discrete(data=vvsa, Range=[np.log10(pdr.loc['VSA', 'Maximum']), 1], intervals=intervals,
+                                      index=name))
+            pl0.append(dense_discrete(data=vf2r, Range=[np.log10(pdr.loc['F2R', 'Minimum']),
+                                                        np.log10(pdr.loc['F2R', 'Maximum'])],
+                                      intervals=intervals, index=name))
+            for p in ['F1(Hz)', 'F2(Hz)', 'F3(Hz)']:
+                for vv, uu in zip(['a', 'i', 'u'], [ppa.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppa.shape[0])), :], 
+                                                    ppi.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppi.shape[0])), :], 
+                                                    ppu.sort_values('kde', ascending=False).iloc[:int(np.ceil(threshold * ppu.shape[0])), :]]):
+                    pl0.append(dense_discrete(data=uu[p].to_numpy(), Range=[np.log10(pdr.loc[p[:2] + vv, 'Minimum']),
+                                                                            np.log10(pdr.loc[p[:2] + vv, 'Maximum'])],
+                                              intervals=intervals, index=name))
+            for p in ['B1(Hz)', 'B2(Hz)', 'B3(Hz)']:
+                for vv, uu in zip(['a', 'i', 'u'], [ppa.sort_values('kde_'+p[:2], ascending=False).iloc[:int(np.ceil(threshold * ppa.shape[0])), :], 
+                                                    ppi.sort_values('kde_'+p[:2], ascending=False).iloc[:int(np.ceil(threshold * ppi.shape[0])), :], 
+                                                    ppu.sort_values('kde_'+p[:2], ascending=False).iloc[:int(np.ceil(threshold * ppu.shape[0])), :]]):
+                    pl0.append(
+                        dense_discrete(data=uu[p].to_numpy(), Range=[np.log10(pdr.loc[p[:2] + vv, 'Maximum']), 0.1],
+                                       intervals=intervals, index=name))
+            pl.append(pd.concat(pl0, axis=1))
+            pdn.loc[name] = np.hstack([vfcr, vvsa, vf2r])
+        pdl = pd.concat(pl)
+        #the spline interpolation
+        for i in list(sik.keys()):
+            for x, y in enumerate(['FCR', 'VSA', 'F2R']):
+                sp = pdn.loc[i, pdn.columns.to_list()[10000 * x:10000 * (x + 1)]].to_numpy()
+                sp = sp[sp != 0]
+                x = range(sp.shape[0])
+                x_new = np.linspace(0, sp.shape[0], 10000)
+                tck = interpolate.splrep(x, sp)
+                y_smooth = interpolate.splev(x_new, tck)
+                Y = np.sort(y_smooth)[::-1]
+                pdn.loc[i, [s for s in pdn.columns.to_list() if s.startswith(y)]] = Y
+        pdn.to_csv(outpath + '\\data10000.txt', sep='\t', encoding='utf_8_sig')
+        npd0 = []
+        for i in range(21):
+            npd0.append(mms.fit_transform(pdl.iloc[:, intervals * i:intervals * (i + 1)]))
+        npd = np.hstack(npd0)
+        pddata = pd.DataFrame(npd, index=pdl.index.to_list(), columns=pdl.columns.to_list())
+        pddata.to_csv(outpath + '\\Density_' + str(intervals) + '.txt', sep='\t', encoding='utf_8_sig')
+    # PCA fit and transform
+    pnpr = pd.DataFrame(columns=['Accumulated ratio of ' + i for i in
+                                 ['ALL', 'FCR', 'VSA', 'F2R'] + [x + y for x in ['F1', 'F2', 'F3', 'B1', 'B2', 'B3'] for
+                                                                 y in ['a', 'i', 'u']]])
+    acn = np.ones(22, dtype=int)
+    x_transform = []
+    for k, (m, n) in enumerate(zip(pnpr.columns.to_list(), [pddata] + npd0)):
+        pca.fit(n)
+        npr = pca.explained_variance_ratio_
+        for i in range(1, npr.shape[0] + 1):
+            pnpr.loc[i, m] = np.sum(npr[:i])
+        acn[k] = pnpr.loc[pnpr[m] >= 0.95].index.to_list()[0]
+        X_pca = pca.fit_transform(n)[:, :acn[k]]
+        ppca = pd.DataFrame(X_pca, index=pddata.index.to_list(),
+                            columns=['PCA_' + str.split(m, ' ')[-1] + '_' + str(i) for i in range(1, acn[k] + 1)])
+        x_transform.append(ppca)
+        with open(outpath + '\\PCA_' + str(intervals) + '_' + str.split(m, ' ')[-1] + '.pickle', 'wb') as f:
+            pickle.dump(pca, f)
+        fig, ax0 = plt.subplots(figsize=(12, 8))
+        ax1 = ax0.twinx()
+        ax0.plot(np.arange(1, pca.n_components_ + 1),
+                 pca.explained_variance_ratio_, '+', linewidth=5)
+        ax0.set_ylabel(r'PCA explained variance ratio', fontsize=20)
+        ax1.plot(pnpr[m], c=cl[0], linewidth=5)
+        ax1.set_ylabel(r'PCA accumulated variance ratio', fontsize=20)
+        ax1.vlines(x=acn[k], ymin=0, ymax=pnpr.loc[acn[k], m], colors='r', linestyles='dashed')
+        ax1.hlines(y=pnpr.loc[acn[k], m], xmin=acn[k], xmax=ax1.get_xlim()[-1] - 10, colors='r', linestyles='dashed')
+        ax1.text(x=acn[k] - 3, y=-0.02, s=str(acn[k]), fontsize=18)
+        ax1.text(x=ax1.get_xlim()[-1] - 12, y=pnpr.loc[acn[k], m] - 0.01, s=np.round(pnpr.loc[acn[k], m], 2),
+                 fontsize=18)
+        ax1.scatter(x=acn[k], y=pnpr.loc[acn[k], m], c='#be0119', s=32, alpha=0.8)
+        plt.savefig(outpath + '\\pca_loadings_' + str(intervals) + '_' + str.split(m, ' ')[-1] + '.svg', dpi=1200,
+                    bbox_inches='tight')
+        plt.close()
+        with open(outpath + '\\主成分数_' + str(intervals) + '.txt', 'a+') as ff:
+            ff.write(' '.join([str.split(m, ' ')[-1], str(acn[k]), '\n']))
+    pxt = pd.concat(x_transform, axis=1)
+    pxt.to_csv(outpath + '\\PCA_transform_' + str(intervals) + '.txt', sep='\t', encoding='utf_8_sig')
+    return pdn, pddata, pxt
+
+#function for ML training, testing, model save, and figure
+score_set = ('accuracy', 'precision', 'average_precision', 'recall', 'f1', 'roc_auc')
+
+def MLSS(data, data1,outpath,cols=[], var=['OC_OPC'], models=models, shuffle=True, model_output=True,
+         model_name='OC_OPC', val='roc', prefix=''):
+    # data refers to the dataframe contains both feature values and disease information of training cohort
+    # data1 refers to the dataframe contains both feature values and disease information of test cohort
+    # cols controls the PCA-transformed acoustic feature sets used for machine learning
+    # var refers to the disease label used for machine learning
+    # models refers to 12 ML classifier which have been ready in terms of hyperparameter settings
+    # model_output controls if save the trained ML classifiers
+    # model_name and prefix allow for custom naming for saved model
+    # val controls if figure output for ML classifier in terms of ROC curve (default) or precision-recall curve. 
+    # one can name val='' to not to export any figures.
+    # outpath controls where all outputs including models and figures to save
+    data = data.astype({'Gender_no': 'category'})
+    data1 = data1.astype({'Gender_no': 'category'})
+    pdval = pd.DataFrame(columns=['Test_accuracy'])
+    # this dataframe is used to record the test accuracy of each ML model in test cohorts
+    pmodel_n = pd.DataFrame(columns=['CV_' + str(s) for s in range(1, 6)])
+    # this dataframe is used to record the training metrics of each ML model in training cohorts
+    # stratified 5-fold cross-validation is adopt in this study
+    aval=data1[var]
+    # this dataframe is used to record individual prediction outcome and probability
+    for name, model in tqdm(models):
+        for va in var:
+            cv_results = model_selection.cross_validate(model, data[cols + ['Gender_no', 'Age']], data[va],
+                                                        cv=SKF(n_splits=5, shuffle=shuffle), scoring=score_set)
+            for sc in list(score_set):
+                pmodel_n.loc[name + '_' + model_name + '_' + sc] = cv_results['test_' + sc]
+            if model_output:
+                model.fit(data[cols + ['Gender_no', 'Age']], data[va])
+                with open(outpath + '\\' + prefix + '_' + name + '_' + model_name + '.pickle',
+                          'wb') as f:
+                    pickle.dump(model, f)
+            for ix in data1.index.to_list():
+                aval.loc[ix, 'Prediction_outcome_' + name + '_' + model_name] = model.predict(
+                    data1.loc[ix][cols + ['Gender_no', 'Age']].to_numpy().reshape(1, -1)).flatten()
+                aval.loc[ix, [p + '_' + name + '_' + model_name for p in ['PPP', 'NPP']]] = model.predict_proba(
+                    data1.loc[ix][cols + ['Gender_no', 'Age']].to_numpy().reshape(1, -1)).flatten()
+            X = data1[cols + ['Gender_no', 'Age']].to_numpy()
+            y = data1[va].to_numpy()
+            pdval.loc[name + "_" + model_name] = model.score(X, y)
+            # always try to plot the confusion matrix
+            try:
+                disp = ConfusionMatrixDisplay.from_estimator(
+                    model,
+                    X,
+                    y,
+                    cmap=plt.cm.Blues,
+                    normalize=None
+                )
+                disp.ax_.set_title('cm_' + name + '_' + model_name, fontsize=18)
+                plt.savefig(outpath + '\\CM_' + prefix + '_' + name + '_' + model_name + '.svg',
+                            dpi=1200,
+                            bbox_inches='tight')
+                plt.close()
+            except:
+                print('----The Confusion Matrix Plot of ' + name + ' in regard to ' + model_name + ' failed----')
+            if val == 'roc':
+                tprs = []
+                aucs = []
+                mean_fpr = np.linspace(0, 1, 100)
+                fig, ax = plt.subplots(figsize=(10, 8))
+                for ii, (train, test) in enumerate(skf.split(X, y)):
+                    viz = RocCurveDisplay.from_estimator(
+                        model,
+                        X[test],
+                        y[test],
+                        name="ROC fold {}".format(ii + 1),
+                        alpha=0.3,
+                        lw=1,
+                        ax=ax,
+                    )
+                    interp_tpr = np.interp(mean_fpr, viz.fpr, viz.tpr)
+                    interp_tpr[0] = 0.0
+                    tprs.append(interp_tpr)
+                    aucs.append(viz.roc_auc)
+
+                ax.plot([0, 1], [0, 1], linestyle="--", lw=2, color="r", label="Chance", alpha=0.8)
+
+                mean_tpr = np.mean(tprs, axis=0)
+                mean_tpr[-1] = 1.0
+                mean_auc = auc(mean_fpr, mean_tpr)
+                std_auc = np.std(aucs)
+                ax.plot(
+                    mean_fpr,
+                    mean_tpr,
+                    color=cl[2],
+                    label=r"Mean ROC (AUC = %0.2f $\pm$ %0.2f)" % (mean_auc, std_auc),
+                    lw=2,
+                    alpha=0.8,
+                )
+
+                std_tpr = np.std(tprs, axis=0)
+                tprs_upper = np.minimum(mean_tpr + std_tpr, 1)
+                tprs_lower = np.maximum(mean_tpr - std_tpr, 0)
+                ax.fill_between(
+                    mean_fpr,
+                    tprs_lower,
+                    tprs_upper,
+                    color="grey",
+                    alpha=0.2,
+                    label=r"$\pm$ 1 std. dev.",
+                )
+
+                ax.set(
+                    xlim=[-0.05, 1.05],
+                    ylim=[-0.05, 1.05])
+                ax.set_title("Receiver operating characteristic of " + name + ' in regard to ' + model_name,
+                             fontsize=18)
+                ax.legend(loc="lower right", fontsize=15)
+                ax.set_xlabel(r'FPR', fontsize=16)
+                ax.set_ylabel(r'TPR', fontsize=16)
+                plt.savefig(outpath + '\\ROC_' + prefix + '_' + name + '_' + model_name + '.svg',
+                            bbox_inches='tight', dpi=1200)
+                plt.close()
+            if val == 'prc':
+                tprs = []
+                aucs = []
+                mean_fpr = np.linspace(0, 1, 100)
+                fig, ax = plt.subplots(figsize=(10, 8))
+                for ii, (train, test) in enumerate(skf.split(X, y)):
+                    viz = PrecisionRecallDisplay.from_estimator(
+                        model,
+                        X[test],
+                        y[test],
+                        name="PR fold {}".format(ii + 1),
+                        alpha=0.3,
+                        lw=1,
+                        ax=ax,
+                    )
+                    interp_tpr = np.interp(mean_fpr, viz.recall[::-1], viz.precision)
+                    tprs.append(interp_tpr)
+                    aucs.append(viz.average_precision)
+
+                mean_tpr = np.mean(tprs, axis=0)
+                mean_auc = auc(mean_fpr, mean_tpr)
+                std_auc = np.std(aucs)
+                ax.plot(
+                    mean_fpr,
+                    mean_tpr[::-1],
+                    color=cl[2],
+                    label=r"Mean PR (AP = %0.2f $\pm$ %0.2f)" % (mean_auc, std_auc),
+                    lw=2,
+                    alpha=0.8,
+                )
+
+                std_tpr = np.std(tprs, axis=0)
+                tprs_upper = np.minimum(mean_tpr + std_tpr, 1)
+                tprs_lower = np.maximum(mean_tpr - std_tpr, 0)
+                ax.fill_between(
+                    mean_fpr[::-1],
+                    tprs_lower,
+                    tprs_upper,
+                    color="grey",
+                    alpha=0.2,
+                    label=r"$\pm$ 1 std. dev.",
+                )
+                ax.set_title("Precision recall curve of " + name + ' in regard to ' + model_name,
+                             fontsize=18)
+                ax.legend(loc="lower right", fontsize=15)
+                ax.set_xlabel(r'Recall', fontsize=16)
+                ax.set_ylabel(r'Precision', fontsize=16)
+                plt.savefig(outpath + '\\PRC_' + prefix + '_' + name + "_" + model_name + '.svg',
+                            bbox_inches='tight', dpi=1200)
+            plt.close()
+    time.sleep
+    return pmodel_n,pdval,aval
+
+#function for shapley analysis and feature selection
+def shap_selection(data,data1,set1,path,path1,path2,savepath,cca0):
+    # data refers to the dataframe contains both feature values and disease information of training cohort
+    # data1 refers to the dataframe contains both feature values and disease information of test cohort
+    # set1 refers to the disease variable names involved in CCA analysis
+    # path refers to the directory containing trained models with best test accuracies in each learning task
+    # path1 refers to the directory containing the PCA-transformed data
+    # path2 refers to the absolute excel file path containing 19 sheets with each sheet for each learning task
+    # savepath controls which directory all files export to 
+    # cca0 refers to the maximal CCA score in CCA feature selection. 
+    ds = pd.ExcelFile(path2)
+    dsd = {}
+    for sn in ds.sheet_names:
+        dsd[i] = ds.parse(sheet_name=sn, index_col=0)
+    pex = {}
+    pex1 = {}
+    for i in tqdm([file[:-7] for file in os.listdir(path)]):
+        clf = joblib.load(path + '\\' + i + '.pickle')
+        suffix = '_'.join(i.split('_')[-2:])
+        target='_'.join(i.split('+')[0].split('_')[1:])
+        model = dmodels[i.split('_')[0]]
+        pcdata = pd.read_csv(path1 + '\\' + i.split('_')[-2] + '_PCA_transform_' + i.split('_')[-1] + '.txt',
+                             index_col=0, sep='\t')
+        pcd = pd.merge(dsd[target], pcdata, left_index=True, right_index=True)
+        X = pcd[list(clf.feature_names_in_)]
+        y = pcd[target]
+        X_train, y_train = X.loc[pcd.loc[pcd['Training set'] == 'Yes'].index.to_list()], y.loc[
+            pcd.loc[pcd['Training set'] == 'Yes'].index.to_list()]
+        X_test = X.loc[pcd.loc[pcd['Training set'] == 'No'].index.to_list()]
+        model.fit(X_train, y_train)
+        try:
+            explainer = shap.Explainer(model)
+            shap_values = explainer(X_test)
+            shap_data1 = pd.DataFrame(shap_values.argsort.data, index=X_test.index.to_list(),
+                                columns=list(clf.feature_names_in_))
+            shap_data1.to_csv(savepath + '\\' + i + '_SHAP1.txt', encoding='utf_8_sig',
+                              sep='\t')
+            pex1[i] = shap_data1
+        except:
+            explainer = shap.KernelExplainer(model.predict_proba, X_train, link='logit')
+            shap_values = explainer.shap_values(X_test)
+            shap_data = pd.DataFrame(shap_values[0], index=X_test.index.to_list(),
+                                      columns=list(clf.feature_names_in_))
+            shap_data.to_csv(savepath + '\\' + i + '_SHAP.txt', encoding='utf_8_sig',
+                              sep='\t')
+            pex[i] = shap_data
+        time.sleep
+    pshap = pd.DataFrame(
+        columns=['Ind_threshold', 'Group_threshold', 'CCA_score'] + [file[:-7] for file in os.listdir(path)] + ['Num_' + ii for ii in [file[:-7] for file in os.listdir(path)]])
+    dshap = {}
+    mf_shap = []
+    for ind in tqdm(np.linspace(0.5, 0.9, 10)):
+        for group in np.linspace(0.3, 0.8, 12):
+            pshap.loc[str(ind) + '+' + str(group), ['Ind_threshold', 'Group_threshold']] = np.asarray([ind, group],
+                                                                                                      dtype=np.float)
+            for i, j in pex1.items():
+                shapset = []
+                nf = j.shape[-1]
+                nc = j.shape[0]
+                for ix in j.index.to_list():
+                    for col in j.columns.to_list():
+                        if float(j.loc[ix, col]) >= np.floor(ind * nf):
+                            if col in ['Age', 'Gender_no']:
+                                shapset.append(col)
+                            else:
+                                shapset.append(col + '_' + suffix)
+                dset = [f for f, c in dict(Counter(shapset)).items() if float(c) >= np.floor(group * nc)]
+                dshap[i] = dset
+            for i, j in pex.items():
+                shapset = []
+                pim = pd.DataFrame(np.argsort(np.abs(j), axis=1), columns=j.columns.to_list())
+                nf = j.shape[-1]
+                nc = j.shape[0]
+                for ix in pim.index.to_list():
+                    for col in pim.columns.to_list():
+                        if float(pim.loc[ix, col]) >= np.floor(ind * nf):
+                            if col in ['Age', 'Gender_no']:
+                                shapset.append(col)
+                            else:
+                                shapset.append(col + '_' + suffix)
+                dset = [f for f, c in dict(Counter(shapset)).items() if float(c) >= np.floor(group * nc)]
+                dshap[i] = dset
+            ddset = []
+            for i, j in dshap.items():
+                pshap.loc[str(ind) + '+' + str(group), 'Num_' + i] = np.asarray([len(j)], dtype=np.int)
+                pshap.loc[str(ind) + '+' + str(group), i] = '+'.join(j)
+                ddset += j
+            ddset = list(set(ddset))
+            for ff in ddset:
+                with open(savepath + '\\' + str(ind) + '_' + str(group) + '_SHAP_in.txt',
+                          'a+') as f:
+                    f.write(ff + '\n')
+            X, y = data[set1], data[ddset]
+            X1, y1 = data1[set1], data1[ddset]
+            X_norm, y_norm = (X - X.mean()) / X.std(), (y - y.mean()) / y.std()
+            X1_norm, y1_norm = (X1 - X1.mean()) / X1.std(), (y1 - y1.mean()) / y1.std()
+            cca.fit(X_norm, y_norm)
+            coe = cca.score(X1_norm, y1_norm)
+            pshap.loc[str(ind) + '+' + str(group), 'CCA_score'] = coe
+            if coe > cca0:
+                mf_shap += ddset
+        time.sleep
+    pshap.sort_values('CCA_score', inplace=True)
+    pshap.to_csv(savepath + '\\SHAP_Hypertune.txt', sep='\t', encoding='utf_8_sig')
+    for i in mf_shap:
+        with open(savepath + '\\SHAP_features_in_wordcloud.txt', 'a+') as f:
+            f.write(i + '\n')
+    mf_shap = list(set(mf_shap))
+    for i in mf_shap:
+        with open(savepath + '\\SHAP_features_in_unique.txt', 'a+') as f:
+            f.write(i + '\n')
+    return pshap, mf_shap
+
+#function for permutation inspection
+def PI_selection(data,data1,set1,path,path1,path2,savepath,cca0,n_repeats=100, random_state=2):
+    # data refers to the dataframe contains both feature values and disease information of training cohort
+    # data1 refers to the dataframe contains both feature values and disease information of test cohort
+    # set1 refers to the disease variable names involved in CCA analysis
+    # path refers to the directory containing trained models with best test accuracies in each learning task
+    # path1 refers to the directory containing the PCA-transformed data
+    # path2 refers to the absolute excel file path containing 19 sheets with each sheet for each learning task
+    # savepath controls which directory all files export to 
+    # cca0 refers to the maximal CCA score in CCA feature selection.
+    ds = pd.ExcelFile(path2)
+    dsd = {}
+    for sn in ds.sheet_names:
+        dsd[i] = ds.parse(sheet_name=sn, index_col=0)
+    for i in tqdm([file[:-7] for file in os.listdir(path)]):
+        clf = pickle.load(path + '\\' + i + '.pickle')
+        suffix = '_'.join(i.split('_')[-2:])
+        target = '_'.join(i.split('+')[0].split('_')[1:])
+        pcdata = pd.read_csv(path1 +'\\'+i.split('_')[-2] +'PCA_transform_' + i.split('_')[-1] + '.txt',
+                             index_col=0, sep='\t')
+        pcd = pd.merge(dsd[target], pcdata, left_index=True, right_index=True)
+        X = pcd[list(clf.feature_names_in_)]
+        y = pcd[target]
+        result = permutation_importance(clf, X, y, n_repeats=n_repeats, random_state=random_state)
+        pdim = pd.DataFrame(result.importances, index=list(clf.feature_names_in_), columns=range(1, 101))
+        pdim.to_csv(savepath + '\\' + i + '_PI.txt', sep='\t', encoding='utf_8_sig')
+        time.sleep
+    pmlpi = pd.DataFrame(columns=['Zero_num', 'First_num', 'CCA_score', 'Num_features'])
+    fmlpi = []
+    for zero_num in tqdm(range(10, 91, 5)):
+        for first_num in np.linspace(0.1, 0.9, 17):
+            pmlpi.loc[str(zero_num) + '+' + str(first_num), ['Zero_num', 'First_num']] = np.asarray(
+                [zero_num, first_num])
+            dicpi = {}
+            lpi = []
+            for i in [[file[:-7] for file in os.listdir(path)]]:
+                ppi = pd.read_csv(savepath + '\\' + i + '_PI.txt', sep='\t', index_col=0)
+                ppi['Mean'] = ppi.mean(axis=1)
+                ppi['Num_0'] = [np.sum(ppi.loc[f].to_numpy()[:-1] == 0) for f in ppi.index.to_list()]
+                ppi0 = ppi.loc[ppi['Num_0'] <= zero_num]
+                in_f = ppi0.sort_values('Mean', ascending=False).index.to_list()[:round(first_num * ppi0.shape[0])]
+                dicpi[i] = [f + '_' + '_'.join(i.split('_')[-2:]) if f[:3] == 'PCA' else f for f in in_f]
+                lpi += [f + '_' + '_'.join(i.split('_')[-2:]) if f[:3] == 'PCA' else f for f in in_f]
+            lpi0 = list(set(lpi))
+            pmlpi.loc[str(zero_num) + '+' + str(first_num), 'Num_features'] = len(lpi0)
+            for i in lpi0:
+                with open(savepath + '\\Features_in_ML+PI_' + str(
+                        zero_num) + '_' + str(first_num) + '.txt',
+                          'a+') as ff:
+                    ff.write(i + '\n')
+            X, y = data[set1], data[lpi0]
+            X1, y1 = data1[set1], data1[lpi0]
+            X_norm, y_norm = (X - X.mean()) / X.std(), (y - y.mean()) / y.std()
+            X1_norm, y1_norm = (X1 - X1.mean()) / X1.std(), (y1 - y1.mean()) / y1.std()
+            cca.fit(X_norm, y_norm)
+            coe = cca.score(X1_norm, y1_norm)
+            pmlpi.loc[str(zero_num) + '+' + str(first_num), 'CCA_score'] = coe
+            if coe>cca0:
+                fmlpi+=lpi0
+        time.sleep
+    pmlpi.sort_values('CCA_score', ascending=False, inplace=True)
+    pmlpi.to_csv(savepath + '\\Features_in_ALL_ML+PI_CCA.txt', sep='\t',
+                 encoding='utf_8_sig')
+    for i in fmlpi:
+        with open(savepath + '\\Features_in_ML+PI_wordcloud.txt', 'a+') as f:
+            f.write(i + '\n')
+    fmlpi=list(set(fmlpi))
+    for i in fmlpi:
+        with open(savepath + '\\Features_in_ML+PI_unique.txt', 'a+') as f:
+            f.write(i + '\n')
+    return pmlpi,fmlpi
+
+#function for ordinal classification tasks
+def OrdiClass(data1,path,path1,path2,savepath,refit_name,state='T',order=[1,2,3,4],group='HNC',):
+    # data1 refers to the dataframe contains disease information of test cohort
+    # path refers to the directory containing trained models with best test accuracies in each learning task
+    # path1 refers to the directory containing text files of selected models involved in ordinal classification
+    # path2 refers to the directory containing files of testing prediction probability of all trained models
+    # savepath controls which directory all files export to 
+    # refit_name is a name list of the re-trained ML models using selected features as mentioned before
+    # state refers to the specific disease status (i.e. T, N and stage) involved in ordinal classification, here T as default.
+    # order corresponds to the concrete subclasses in specific state
+    # group refers to specific subgroup (i.e. OC_OPC and TFC) involved in ordinal classification, here HNC (OC_OPC) as default.
+    ds = data1.loc[data1['Group']==group]
+    clfs={}
+    for i in order[:-1]:
+        with open(path1 + '\\' + state+'_'+str(i)+'_'+group+'.txt') as f:
+            clfs[i] = [ii.strip('\n') for ii in f.readlines()]
+    dpd={}
+    for k,pdi in clfs.items():
+        for m in pdi:
+            if m in refit_name:
+                dpd[m] = pd.read_csv(path2 + '\\a_individual_prediction.txt', sep='\t', index_col=0)
+            else:
+                dpd[m] = pd.read_csv(
+                    path2 + '\\' + m.split('_')[-2] + '_' + m.split('_')[-1] + '_individual_prediction.txt',
+                    sep='\t', index_col=0)
+    pcom=pd.DataFrame(columns=['Accuracy'])
+    ppred=pd.DataFrame(columns=['y_gound','y_pred'])
+    for com in tqdm(list(product(*[clfs[x] for x in order[:-1]]))):
+        pdprob = pd.DataFrame(columns=['Prob_' + str(c) for c in order] + ['Outcome'])
+        for sub in ds.index.to_list():
+            npred=[int(ds.loc[sub,state])]
+            nprob=np.ones(len(order),)
+            ix=[]
+            for o, ppd in enumerate(com):
+                pred = int(dpd[ppd].loc[sub, 'Prediction_outcome_' + '_'.join(ppd.split('_')[:3])])
+                prob = dpd[ppd].loc[sub, 'PPP_' + '_'.join(ppd.split('_')[:3])]
+                nprob[o] = prob
+                ix.append(ppd)
+            nprob[-1]=1-nprob[-2]
+            nprob[-2] = (1 - nprob[1]) * prob
+            nprob[1]=(1-nprob[0])*nprob[1]
+            pdprob.loc[sub,['Prob_'+str(c) for c in order]]=nprob
+            pdprob.loc[sub, 'Outcome'] = float(order[np.argmax(nprob)])
+            npred+=[order[np.argmax(nprob)]]
+            ppred.loc['+'.join(ix)+':'+sub]=npred
+        pcom.loc['+'.join(ix)]=np.sum(ds[state]==pdprob['Outcome'])/ds.shape[0]
+        time.sleep
+    pcom.sort_values('Accuracy',ascending=False,inplace=True)
+    best_com=[cm for cm in pcom.index.to_list() if pcom.loc[cm,'Accuracy']==pcom.iloc[0,0]]
+    ppred0=ppred.loc[[cm for cm in ppred.index.to_list() if cm.split(':')[0] in best_com]]
+    pcom.to_csv(savepath + '\\' + state + '_' + group + '_oc.txt', encoding='utf_8_sig', sep='\t')
+    ppred0.to_csv(savepath + '\\' + state + '_' + group + '_oci.txt', encoding='utf_8_sig', sep='\t')
+    return pcom,ppred0
+
+#function　for unsupervised learning using manifold learning and K-medoids clustering
+def pam_cluster(phnc, pscc,savepath,lifepath,features_in,random_state=2):
+    # phnc refers to the dataframe contains disease information of all OC and OPC patients
+    # pscc refers to the dataframe contains disease information of all cancer patients whose pathology was squamous cell carcinoma (SCC).
+    # savepath controls which directory all files export to 
+    # lifepath refers to the directory containing files of disease variables and follow-up survival information 
+    # features_in controls selected features used for manifold learning
+    writer1 = pd.ExcelWriter(savepath + '\\TSNE+MDS_outcome.xlsx')
+    ptdp=pd.read_csv(lifepath+'\\Progression_12.txt',index_col=0,sep='\t')
+    ptdd=pd.read_csv(lifepath+'\\Death_52.txt',index_col=0,sep='\t')
+    plogrank = pd.DataFrame(columns=['P_value'])
+    for i in tqdm(range(2, 5)):
+        for j in range(2, 4):
+            for g, d in zip(['HNC', 'SCC'], [phnc, pscc]):
+                data_std = std.fit_transform(d[features_in])
+                td2 = MDS(n_components=j, max_iter=1000, random_state=random_state).fit_transform(data_std)
+                k = KMedoids(n_clusters=i, distance='euclidean', max_iter=1000).fit_predict(td2)
+                ptd2 = pd.DataFrame(td2, index=d.index.to_list(),
+                                    columns=[g + '_ALL_MDS_' + str(x) for x in range(1, j + 1)])
+                ptd2['Cluster_MDS'] = k+1
+                td1 = TSNE(n_components=j, init="pca", learning_rate=250, random_state=random_state, perplexity=50, method='exact',
+                           early_exaggeration=15).fit_transform(data_std)
+                k = KMedoids(n_clusters=i, distance='euclidean', max_iter=1000).fit_predict(td1)
+                ptd1 = pd.DataFrame(td1, index=d.index.to_list(),
+                                    columns=[g + '_ALL_TSNE_' + str(x) for x in range(1, j + 1)])
+                ptd1['Cluster_TSNE'] = k+1
+                ptd12 = pd.concat([ptd1, ptd2, d], axis=1,join='inner')
+                ptd_d = pd.concat([ptd12, ptdd], axis=1, join='inner')
+                ptd_p = pd.concat([ptd12, ptdp], axis=1, join='inner')
+                for x, y, title, dss in zip(['P', 'D'], [['PW', 'PM'], ['DW', 'DM']], ['Progression', 'Death'],
+                                            [ptd_p, ptd_d]):
+                    for yy in y:
+                        T = dss[yy]
+                        E = dss[x]
+                        for m in ['TSNE', 'MDS']:
+                            if i > 2:
+                                lr = multivariate_logrank_test(T, dss['Cluster_' + m], E, alpha=.99)
+                                plogrank.loc[str(i) + 'C_' + str(j) + 'D_ALL_' + m + '_' + x + '_' + yy[
+                                    -1] + '_in_' + g] = lr.p_value
+                                for co in list(combinations([cc for cc in range(1, i + 1)], 2)):
+                                    lr = logrank_test(T[dss1['Cluster_' + m] == co[0]],
+                                                      T[dss1['Cluster_' + m] == co[1]],
+                                                      E[dss1['Cluster_' + m] == co[0]],
+                                                      E[dss1['Cluster_' + m] == co[1]], alpha=.99)
+                                    plogrank.loc[str(i) + 'C_' + str(j) + 'D_ALL_' + m + ''.join(
+                                        [str(ccc) for ccc in co]) + '_' + x + '_' + yy[-1] + '_in_' + g] = lr.p_value
+                            else:
+                                group = (dss['Cluster_' + m] == 1)
+                                lr = logrank_test(T[group], T[~group], E[group], E[~group], alpha=.99)
+                                plogrank.loc[str(j) + 'C_' + str(j) + 'D_ALL_' + m + '_' + x + '_' + yy[
+                                    -1] + '_in_' + g] = lr.p_value
+                            ax = plt.subplot(111)
+                            for ii in range(i):
+                                group = (dss['Cluster_' + m] == ii + 1)
+                                km = KaplanMeierFitter()
+                                km.fit(T[group], event_observed=E[group], label="cluster {}".format(str(ii + 1)))
+                                km.plot(ax=ax, color=sns.husl_palette(n_colors=i)[ii])
+                            ax.set_title(title + ' in units of ' + dict(zip(['W', 'M'], ['week', 'month']))[yy[-1]],
+                                         fontsize=20,
+                                         fontweight='bold')
+                            ax.set_xlabel(dict(zip(['W', 'M'], ['Weeks', 'Months']))[yy[-1]], fontsize=18,
+                                          fontweight='bold')
+                            plt.savefig(savepath+'\\Cluster' + str(i) + '_' + 'ALL_pam_in_' + g + '_' + str(
+                                    j) + 'D_' + title + '_' + yy[-1] + '_KMP.svg', dpi=1200, bbox_inches='tight')
+                            plt.close()
+                ptd12.to_excel(writer1, g + '_D' + str(j) + '_C' + str(i))
+                writer1.save()
+        time.sleep
+    plogrank.sort_values('P_value', inplace=True)
+    plogrank.to_csv(savepath + '\\Logrank_pvalues.txt', sep='\t', encoding='utf_8_sig')
+    return pd.ExcelFile(savepath + '\\TSNE+MDS_outcome.xlsx'),plogrank
+
+#function for survival analysis including log rank and Weibull accelerated failure time model 
+def survival_aft(phnc, pscc,path,lifepath,savepath,base_vars=['Age', 'Gender', 'CRP', 'SII', 'NLR', 'MLR']):
+    # phnc refers to the dataframe contains disease information of all OC and OPC patients
+    # pscc refers to the dataframe contains disease information of all cancer patients whose pathology was squamous cell carcinoma (SCC).
+    # path refers to the excel file path of unsupervised learning outcome
+    # lifepath refers to the directory containing files of disease variables and follow-up survival information
+    # savepath controls which directory all files export to 
+    # base_vars determines which disease variables are included as independent factors used for multivariate survival analysis.
+    cds=pd.ExcelFile(path)
+    ptd_p = pd.read_csv(lifepath + '\\Progression_12.txt', index_col=0, sep='\t')
+    ptd_d = pd.read_csv(lifepath + '\\Death_52.txt', index_col=0, sep='\t')
+    pd_waft_multi = pd.DataFrame(columns=['Bi_stage_p', 'P_value', 'AIC_partial', 'C_index', 'Log_LH'])
+    for i in tqdm(range(2, 5)):
+        for j in range(2, 4):
+            for g, d in zip(['HNC', 'SCC'], [phnc.index.to_list(), pscc.index.to_list()]):
+                ptd = cds.parse(sheet_name=g + '_D' + str(j) + '_C' + str(i), index_col=0)
+                ptd['Bi_stage'] = np.asarray(
+                    [0 if (ptd.loc[ix, 'Stage_3'] == 0 and ptd.loc[ix, 'Stage_4'] == 0) else 1 for ix in
+                     ptd.index.to_list()])
+                ptd = ptd.astype(dict(zip(['Gender', 'Bi_stage'], ['category'] * 2)))
+                ptd1 = ptd1.astype(dict(zip(['Cluster_TSNE', 'Cluster_MDS'], [np.int] * 2)))
+                ssa += ['Bi_stage']
+                for m in ['TSNE', 'MDS']:
+                    if i > 2:
+                        ptd1 = pd.get_dummies(ptd1, columns=['Cluster_' + m], drop_first=True)
+                        ssa += ['Cluster_' + m + '_' + str(c) for c in range(2, i + 1)]
+                    else:
+                        ssa += ['Cluster_' + m]
+                    for x, y, title, dss in zip(['P', 'D'], [['PW', 'PM'], ['DW', 'DM']],
+                                                ['Progression', 'Death'], [ptd_p, ptd_d]):
+                        dss1 = ptd1.loc[[ix for ix in ptd1.index.to_list() if ix in dss.index.to_list()]]
+                        for yy in y:
+                            aft = WeibullAFTFitter()
+                            aft.fit(dss1[[yy, x] + ssa], duration_col=yy, event_col=x)
+                            f, ax = plt.subplots(figsize=(7, 4))
+                            aft.plot(ax=ax)
+                            plt.savefig(savepath + '\\' +m + '_AFT_multi_' + str(
+                                    i) + 'C_' + str(j) + 'D_ALL_' + x + '_' + yy[
+                                    -1] + '_in_' + g + '.svg',dpi=1200, bbox_inches='tight')
+                            plt.close()
+                            aft.summary.to_csv(savepath+'\\' + m + '_AFT_multi_' + str(
+                                    i) + 'C_' + str(j) + 'D_ALL_' + x + '_' + yy[
+                                    -1] + '_in_' + g + '.txt', sep='\t', encoding='utf_8_sig')
+                            pd_waft_multi.loc[
+                                m + '_' + str(i) + 'C_' + str(j) + 'D_ALL_' + x + '_' + yy[-1] + '_in_' + g] = [aft.summary.loc[('lambda_',
+                                                                                                                       'Bi_stage'), 'p'],
+                                                                                                                   aft.summary.loc[
+                                                                                                                       [('lambda_',s)
+                                                                                                                           for s in
+                                                                                                                           ssa[7:]]][
+                                                                                                                       'p'].to_list()] + [
+                                                                                                                   aft.AIC_,
+                                                                                                                   aft.concordance_index_,
+                                                                                                                   aft.log_likelihood_]
+        time.sleep
+    pd_waft_multi['P_min'] = np.asarray([np.min(np.asarray(pd_waft_multi.loc[i, 'P_value'])) for i in pd_waft_multi.index.to_list()])
+    pd_waft_multi.sort_values('P_min', inplace=True)
+    pd_waft_multi.to_csv(savepath + '\\multi_aft_pvalues.txt', sep='\t',encoding='utf_8_sig')
+    return pd_waft_multi
